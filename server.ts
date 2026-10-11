@@ -71,9 +71,9 @@ function scheduleSave() {
     saveTimeout = null;
     try {
       const dataToSave = {
-        strokes: state.strokes.slice(-2500),
+        strokes: state.strokes.slice(-3000),
         snapshots: state.snapshots.slice(-5),
-        chatMessages: state.chatMessages.slice(-150),
+        chatMessages: state.chatMessages.slice(-200),
         reports: state.reports.slice(-50),
         canvasVersion: state.canvasVersion,
         clearedAt: state.clearedAt,
@@ -106,7 +106,7 @@ function getOnlineUsersList(): OnlineUser[] {
   const now = Date.now();
   const list: OnlineUser[] = [];
   for (const [uid, item] of activeUsers.entries()) {
-    if (now - item.lastSeen > 15000) {
+    if (now - item.lastSeen > 20000) {
       activeUsers.delete(uid);
     } else {
       list.push(item.user);
@@ -119,7 +119,7 @@ function getOnlineUsersList(): OnlineUser[] {
 setInterval(() => {
   const now = Date.now();
   for (const [uid, item] of activeUsers.entries()) {
-    if (now - item.lastSeen > 15000) {
+    if (now - item.lastSeen > 20000) {
       activeUsers.delete(uid);
     }
   }
@@ -128,8 +128,9 @@ setInterval(() => {
 // SSE connection pool
 const sseClients = new Set<express.Response>();
 
-// Connected WebSocket clients
+// Connected WebSocket clients (keyed by unique connection ID to prevent collision)
 interface ConnectedClient {
+  connId: string;
   ws: WebSocket;
   user: OnlineUser;
   ip: string;
@@ -213,33 +214,33 @@ async function startServer() {
     });
   });
 
-  // Full & Delta State Endpoint
+  // Full & Delta State Endpoint (Returns all recent strokes including undone states for exact sync)
   app.get('/api/state', (req, res) => {
-    const sinceTime = parseInt(req.query.since as string, 10) || 0;
     const latestSnapshot =
       state.snapshots.length > 0 ? state.snapshots[state.snapshots.length - 1] : null;
-
-    const activeStrokes = state.strokes.filter(s => !s.isUndone && (sinceTime === 0 || s.createdAt > sinceTime));
     const online = getOnlineUsersList();
 
     res.json({
       canvasVersion: state.canvasVersion,
       clearedAt: state.clearedAt,
       snapshot: latestSnapshot,
-      strokes: activeStrokes.slice(-1000),
-      chatMessages: state.chatMessages.slice(-60),
+      strokes: state.strokes.slice(-2500),
+      chatMessages: state.chatMessages.slice(-80),
       onlineUsers: online,
     });
   });
 
-  // Server-Sent Events (SSE) stream for 100% reliable real-time push to all devices
+  // Server-Sent Events (SSE) stream for reliable real-time push to all devices
   app.get('/api/events', (req, res) => {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
+    if (typeof (res as any).flushHeaders === 'function') {
+      (res as any).flushHeaders();
+    }
     res.write(': ping\n\n');
 
     // Register SSE client
@@ -252,12 +253,12 @@ async function startServer() {
       userId: 'sse_' + Date.now(),
       users: online,
       snapshot: state.snapshots.length > 0 ? state.snapshots[state.snapshots.length - 1] : null,
-      strokes: state.strokes.filter(s => !s.isUndone).slice(-800),
+      strokes: state.strokes.slice(-1500),
       chatMessages: state.chatMessages.slice(-60),
     };
     res.write(`data: ${JSON.stringify(initMsg)}\n\n`);
 
-    // Keepalive ping every 15s to keep connection open through Cloud Run proxies
+    // Keepalive ping every 12s to keep connection open through Cloud Run proxies
     const keepalive = setInterval(() => {
       try {
         res.write(': ping\n\n');
@@ -265,7 +266,7 @@ async function startServer() {
         clearInterval(keepalive);
         sseClients.delete(res);
       }
-    }, 15000);
+    }, 12000);
 
     req.on('close', () => {
       clearInterval(keepalive);
@@ -286,6 +287,34 @@ async function startServer() {
       canvasVersion: state.canvasVersion,
       clearedAt: state.clearedAt,
     });
+  });
+
+  // User Profile Update Endpoint (Syncs user data in real-time)
+  app.post('/api/user/update', (req, res) => {
+    const { user } = req.body;
+    if (user && user.userId) {
+      touchUser(user);
+      // Update any ws connections for this user
+      wsClients.forEach(client => {
+        if (client.user.userId === user.userId) {
+          client.user.username = user.username || client.user.username;
+          client.user.userColor = user.userColor || client.user.userColor;
+        }
+      });
+      // Broadcast user update to all devices
+      const userUpdatedMsg: WSServerMessage = {
+        type: 'user:updated',
+        user: {
+          userId: user.userId,
+          username: user.username || 'Artist',
+          userColor: user.userColor || '#38bdf8',
+          isModerator: Boolean(user.isModerator),
+          joinedAt: user.joinedAt || Date.now(),
+        },
+      };
+      broadcastAll(userUpdatedMsg);
+    }
+    res.json({ success: true, onlineUsers: getOnlineUsersList() });
   });
 
   // Commit stroke via REST
@@ -444,6 +473,7 @@ async function startServer() {
   // WebSocket Connection Handler
   wss.on('connection', (ws: WebSocket, req) => {
     const ip = req.socket.remoteAddress || '127.0.0.1';
+    const connId = 'conn_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
     let currentUserId: string | null = null;
 
     ws.on('message', (messageData: string) => {
@@ -459,13 +489,12 @@ async function startServer() {
             isModerator: msg.user.isModerator,
             joinedAt: Date.now(),
           };
-          wsClients.set(currentUserId, { ws, user, ip });
+          wsClients.set(connId, { connId, ws, user, ip });
           touchUser(user);
 
           // Send current state
           const latestSnapshot =
             state.snapshots.length > 0 ? state.snapshots[state.snapshots.length - 1] : null;
-          const activeStrokes = state.strokes.filter(s => !s.isUndone).slice(-800);
           const onlineList = getOnlineUsersList();
 
           const initMsg: WSServerMessage = {
@@ -473,7 +502,7 @@ async function startServer() {
             userId: currentUserId,
             users: onlineList,
             snapshot: latestSnapshot,
-            strokes: activeStrokes,
+            strokes: state.strokes.slice(-2000),
             chatMessages: state.chatMessages.slice(-60),
           };
           ws.send(JSON.stringify(initMsg));
@@ -481,9 +510,18 @@ async function startServer() {
           // Broadcast user joined
           const joinMsg: WSServerMessage = { type: 'user:joined', user };
           broadcastAll(joinMsg, ws);
+        } else if (msg.type === 'user:update') {
+          if (!currentUserId) return;
+          const clientData = wsClients.get(connId);
+          if (clientData) {
+            clientData.user.username = msg.user.username || clientData.user.username;
+            clientData.user.userColor = msg.user.userColor || clientData.user.userColor;
+            touchUser(clientData.user);
+            broadcastAll({ type: 'user:updated', user: clientData.user });
+          }
         } else if (msg.type === 'cursor:move') {
           if (!currentUserId) return;
-          const clientData = wsClients.get(currentUserId);
+          const clientData = wsClients.get(connId);
           if (!clientData) return;
 
           const remoteCursor: RemoteCursor = {
@@ -530,7 +568,7 @@ async function startServer() {
             broadcastAll(redoMsg);
           }
         } else if (msg.type === 'canvas:clear') {
-          const clientData = currentUserId ? wsClients.get(currentUserId) : null;
+          const clientData = wsClients.get(connId);
           state.strokes = [];
           state.snapshots = [];
           state.canvasVersion += 1;
@@ -544,30 +582,34 @@ async function startServer() {
           };
           broadcastAll(clearMsg);
         } else if (msg.type === 'chat:message') {
-          const clientData = currentUserId ? wsClients.get(currentUserId) : null;
-          const senderUserId = currentUserId || 'usr_' + Date.now().toString(36);
-          const senderUsername = clientData?.user.username || 'Artist';
-          const senderColor = clientData?.user.userColor || '#38bdf8';
+          const clientData = wsClients.get(connId);
+          const senderUserId = msg.message.userId || currentUserId || 'usr_' + Date.now().toString(36);
+          const senderUsername = msg.message.username || clientData?.user.username || 'Artist';
+          const senderColor = msg.message.userColor || clientData?.user.userColor || '#38bdf8';
 
           const rawText = (msg.message?.text || '').trim();
           if (!rawText) return;
           const sanitizedText = rawText.slice(0, 400);
 
-          const chatMsg: ChatMessage = {
-            id: 'chat_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-            userId: senderUserId,
-            username: senderUsername,
-            userColor: senderColor,
-            text: sanitizedText,
-            isModerator: clientData?.user.isModerator || false,
-            createdAt: Date.now(),
-          };
+          const chatMsgId = msg.message?.id || 'chat_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+          const exists = state.chatMessages.some(m => m.id === chatMsgId);
+          if (!exists) {
+            const chatMsg: ChatMessage = {
+              id: chatMsgId,
+              userId: senderUserId,
+              username: senderUsername,
+              userColor: senderColor,
+              text: sanitizedText,
+              isModerator: clientData?.user.isModerator || false,
+              createdAt: Date.now(),
+            };
 
-          state.chatMessages.push(chatMsg);
-          scheduleSave();
+            state.chatMessages.push(chatMsg);
+            scheduleSave();
 
-          const broadcastChat: WSServerMessage = { type: 'chat:message', message: chatMsg };
-          broadcastAll(broadcastChat);
+            const broadcastChat: WSServerMessage = { type: 'chat:message', message: chatMsg };
+            broadcastAll(broadcastChat);
+          }
         } else if (msg.type === 'snapshot:create') {
           const snapshot: CanvasSnapshot = {
             id: 'snap_' + Date.now(),
@@ -587,10 +629,17 @@ async function startServer() {
     });
 
     ws.on('close', () => {
+      wsClients.delete(connId);
       if (currentUserId) {
-        wsClients.delete(currentUserId);
-        const leaveMsg: WSServerMessage = { type: 'user:left', userId: currentUserId };
-        broadcastAll(leaveMsg);
+        // Only mark user left if no other active connection has this userId
+        const stillConnected = Array.from(wsClients.values()).some(
+          c => c.user.userId === currentUserId
+        );
+        if (!stillConnected) {
+          activeUsers.delete(currentUserId);
+          const leaveMsg: WSServerMessage = { type: 'user:left', userId: currentUserId };
+          broadcastAll(leaveMsg);
+        }
       }
     });
   });

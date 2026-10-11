@@ -66,12 +66,6 @@ export default function App() {
     });
   }, []);
 
-  // Update username handler
-  const handleUpdateUsername = (newName: string) => {
-    saveUsername(newName);
-    setCurrentUser(prev => ({ ...prev, username: newName }));
-  };
-
   const handleRateLimitWarning = useCallback((msg: string) => {
     showBanner(msg);
   }, [showBanner]);
@@ -95,6 +89,7 @@ export default function App() {
     broadcastLiveStroke,
     commitStroke,
     sendChatMessage,
+    updateUserProfile,
     undo,
     redo,
     clearCanvas,
@@ -104,6 +99,13 @@ export default function App() {
     onRateLimitWarning: handleRateLimitWarning,
     onCanvasClearedNotification: handleCanvasCleared,
   });
+
+  // Update username handler with live sync
+  const handleUpdateUsername = (newName: string) => {
+    saveUsername(newName);
+    setCurrentUser(prev => ({ ...prev, username: newName }));
+    updateUserProfile(newName);
+  };
 
   // Live chat moderation & filtering
   const {

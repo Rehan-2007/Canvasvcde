@@ -68,11 +68,11 @@ const ANIMALS = [
 ];
 
 export function generateAnonymousUser(): { userId: string; username: string; userColor: string } {
-  // Check localStorage for existing user credentials
+  // Check sessionStorage for current tab session credentials
   try {
-    const saved = localStorage.getItem('collab_canvas_user');
-    if (saved) {
-      const parsed = JSON.parse(saved);
+    const sessionSaved = sessionStorage.getItem('collab_canvas_user');
+    if (sessionSaved) {
+      const parsed = JSON.parse(sessionSaved);
       if (parsed.userId && parsed.username && parsed.userColor) {
         return parsed;
       }
@@ -81,16 +81,27 @@ export function generateAnonymousUser(): { userId: string; username: string; use
     // ignore
   }
 
+  // Check if user has a preferred username saved in localStorage
+  let savedName = '';
+  let savedColor = '';
+  try {
+    savedName = localStorage.getItem('collab_preferred_username') || '';
+    savedColor = localStorage.getItem('collab_preferred_color') || '';
+  } catch (e) {
+    // ignore
+  }
+
+  // Generate a distinct user ID for this tab/window session
   const userId = 'usr_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 7);
   const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
   const animal = ANIMALS[Math.floor(Math.random() * ANIMALS.length)];
   const num = Math.floor(10 + Math.random() * 89);
-  const username = `${adj} ${animal} ${num}`;
-  const userColor = AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
+  const username = savedName.trim() || `${adj} ${animal} ${num}`;
+  const userColor = savedColor || AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
 
   const userData = { userId, username, userColor };
   try {
-    localStorage.setItem('collab_canvas_user', JSON.stringify(userData));
+    sessionStorage.setItem('collab_canvas_user', JSON.stringify(userData));
   } catch (e) {
     // ignore
   }
@@ -99,12 +110,16 @@ export function generateAnonymousUser(): { userId: string; username: string; use
 }
 
 export function saveUsername(username: string): void {
+  const trimmed = username.trim();
+  if (!trimmed) return;
+
   try {
-    const saved = localStorage.getItem('collab_canvas_user');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      parsed.username = username;
-      localStorage.setItem('collab_canvas_user', JSON.stringify(parsed));
+    localStorage.setItem('collab_preferred_username', trimmed);
+    const sessionSaved = sessionStorage.getItem('collab_canvas_user');
+    if (sessionSaved) {
+      const parsed = JSON.parse(sessionSaved);
+      parsed.username = trimmed;
+      sessionStorage.setItem('collab_canvas_user', JSON.stringify(parsed));
     }
   } catch (e) {
     // ignore

@@ -95,13 +95,14 @@ export interface ConnectionStatus {
 
 export type WSClientMessage =
   | { type: 'join'; user: { userId: string; username: string; userColor: string; isModerator?: boolean } }
+  | { type: 'user:update'; user: { userId: string; username: string; userColor: string } }
   | { type: 'cursor:move'; cursor: { x: number; y: number; tool: ToolType; isDrawing: boolean } }
   | { type: 'stroke:live'; stroke: Partial<Stroke> & { id: string } }
   | { type: 'stroke:commit'; stroke: Stroke }
   | { type: 'stroke:undo'; strokeId: string; userId: string }
   | { type: 'stroke:redo'; strokeId: string; userId: string }
   | { type: 'canvas:clear'; passcode: string; userId: string }
-  | { type: 'chat:message'; message: { text: string } }
+  | { type: 'chat:message'; message: { id?: string; text: string; userId?: string; username?: string; userColor?: string } }
   | { type: 'snapshot:create'; dataUrl: string; strokeCount: number }
   | { type: 'report:submit'; report: Omit<UserReport, 'id' | 'createdAt'> };
 
@@ -117,6 +118,8 @@ export type WSServerMessage =
     }
   | { type: 'user:joined'; user: OnlineUser }
   | { type: 'user:left'; userId: string }
+  | { type: 'user:updated'; user: OnlineUser }
+  | { type: 'users:list'; users: OnlineUser[] }
   | { type: 'cursor:update'; cursor: RemoteCursor }
   | { type: 'stroke:live'; stroke: Partial<Stroke> & { id: string } }
   | { type: 'stroke:commit'; stroke: Stroke }

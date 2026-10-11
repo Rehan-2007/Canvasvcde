@@ -48,14 +48,14 @@ export function useRealtimeCanvas({
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const knownStrokeIds = useRef<Set<string>>(new Set());
-  const isMountedRef = useRef(true);
+  const isMountedStatusRef = useRef(true);
   const lastCanvasVersionRef = useRef<number>(1);
   const lastCursorEmitTime = useRef(0);
   const lastLiveStrokeEmitTime = useRef(0);
 
   // Message handler for incoming server events (used by both WS and SSE)
   const handleServerMessage = useCallback((msg: WSServerMessage) => {
-    if (!isMountedRef.current) return;
+    if (!isMountedStatusRef.current) return;
 
     switch (msg.type) {
       case 'init': {
@@ -102,6 +102,33 @@ export function useRealtimeCanvas({
           next.delete(msg.userId);
           return next;
         });
+        break;
+      }
+
+      case 'user:updated': {
+        setOnlineUsers(prev => {
+          const exists = prev.some(u => u.userId === msg.user.userId);
+          if (exists) {
+            return prev.map(u => (u.userId === msg.user.userId ? msg.user : u));
+          }
+          return [...prev, msg.user];
+        });
+        setRemoteCursors(prev => {
+          if (!prev.has(msg.user.userId)) return prev;
+          const next = new Map(prev);
+          const c = next.get(msg.user.userId)!;
+          next.set(msg.user.userId, {
+            ...c,
+            username: msg.user.username,
+            userColor: msg.user.userColor,
+          });
+          return next;
+        });
+        break;
+      }
+
+      case 'users:list': {
+        setOnlineUsers(msg.users);
         break;
       }
 
@@ -205,7 +232,7 @@ export function useRealtimeCanvas({
 
   // Connect WebSocket
   const connectWs = useCallback(() => {
-    if (!isMountedRef.current) return;
+    if (!isMountedStatusRef.current) return;
 
     if (wsRef.current) {
       wsRef.current.onclose = null;
@@ -227,7 +254,7 @@ export function useRealtimeCanvas({
       wsRef.current = ws;
 
       ws.onopen = () => {
-        if (!isMountedRef.current) return;
+        if (!isMountedStatusRef.current) return;
         setConnectionStatus({ state: 'connected', transport: 'websocket' });
 
         const joinMsg: WSClientMessage = {
@@ -247,37 +274,36 @@ export function useRealtimeCanvas({
       };
 
       ws.onclose = () => {
-        if (!isMountedRef.current) return;
-        // Don't mark disconnected immediately if SSE or polling is active
+        if (!isMountedStatusRef.current) return;
         setConnectionStatus(prev => ({
           ...prev,
           state: prev.transport === 'sse' ? 'connected' : 'reconnecting',
         }));
         if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = setTimeout(connectWs, 4000);
+        reconnectTimeoutRef.current = setTimeout(connectWs, 3500);
       };
 
       ws.onerror = () => {
-        // Fallback to SSE
+        // Fallback to SSE and Polling
       };
     } catch (e) {
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = setTimeout(connectWs, 4000);
+      reconnectTimeoutRef.current = setTimeout(connectWs, 3500);
     }
   }, [handleServerMessage]);
 
-  // Connect Server-Sent Events (SSE) Stream (Guarantees 100% reliable real-time push everywhere)
+  // Connect Server-Sent Events (SSE) Stream
   useEffect(() => {
     let eventSource: EventSource | null = null;
     let sseRetryTimer: NodeJS.Timeout | null = null;
 
     function initSSE() {
-      if (!isMountedRef.current) return;
+      if (!isMountedStatusRef.current) return;
       try {
         eventSource = new EventSource('/api/events');
 
         eventSource.onopen = () => {
-          if (!isMountedRef.current) return;
+          if (!isMountedStatusRef.current) return;
           setConnectionStatus(prev =>
             prev.transport === 'websocket' && prev.state === 'connected'
               ? prev
@@ -290,7 +316,7 @@ export function useRealtimeCanvas({
             const data = JSON.parse(event.data) as WSServerMessage;
             handleServerMessage(data);
           } catch (err) {
-            // ignore ping or non-json
+            // ignore non-json
           }
         };
 
@@ -299,12 +325,12 @@ export function useRealtimeCanvas({
             eventSource.close();
             eventSource = null;
           }
-          if (isMountedRef.current) {
-            sseRetryTimer = setTimeout(initSSE, 5000);
+          if (isMountedStatusRef.current) {
+            sseRetryTimer = setTimeout(initSSE, 4000);
           }
         };
       } catch (err) {
-        sseRetryTimer = setTimeout(initSSE, 5000);
+        sseRetryTimer = setTimeout(initSSE, 4000);
       }
     }
 
@@ -319,29 +345,29 @@ export function useRealtimeCanvas({
     };
   }, [handleServerMessage]);
 
-  // Mount effect: Connect WS and start cleanup intervals
+  // Mount effect: Connect WS and clean stale cursors
   useEffect(() => {
-    isMountedRef.current = true;
+    isMountedStatusRef.current = true;
     connectWs();
 
-    // Clean stale cursors every 4 seconds
+    // Clean stale cursors every 3.5 seconds
     const cursorInterval = setInterval(() => {
       const now = Date.now();
       setRemoteCursors(prev => {
         let changed = false;
         const next = new Map(prev);
         for (const [uid, cursor] of next.entries()) {
-          if (now - cursor.lastActive > 8000) {
+          if (now - cursor.lastActive > 7000) {
             next.delete(uid);
             changed = true;
           }
         }
         return changed ? next : prev;
       });
-    }, 4000);
+    }, 3500);
 
     return () => {
-      isMountedRef.current = false;
+      isMountedStatusRef.current = false;
       clearInterval(cursorInterval);
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
       if (wsRef.current) {
@@ -359,11 +385,11 @@ export function useRealtimeCanvas({
     };
   }, [connectWs]);
 
-  // Periodic heartbeat & Delta reconciliation (Every 1500ms)
+  // Periodic heartbeat & Delta reconciliation (Every 1200ms)
   // Ensures every device across all browsers & tabs stay perfectly in sync
   useEffect(() => {
     const syncWithServer = async () => {
-      if (!isMountedRef.current) return;
+      if (!isMountedStatusRef.current) return;
 
       try {
         // 1. Send heartbeat with current user
@@ -374,7 +400,7 @@ export function useRealtimeCanvas({
         });
         const data = await res.json();
 
-        if (!isMountedRef.current) return;
+        if (!isMountedStatusRef.current) return;
 
         if (data.onlineUsers && Array.isArray(data.onlineUsers)) {
           setOnlineUsers(data.onlineUsers);
@@ -383,7 +409,6 @@ export function useRealtimeCanvas({
         // If canvas was cleared on server, immediately wipe local state
         if (data.canvasVersion && data.canvasVersion !== lastCanvasVersionRef.current) {
           lastCanvasVersionRef.current = data.canvasVersion;
-          // Re-fetch full state
           const stateRes = await fetch('/api/state');
           const stateData = await stateRes.json();
           if (stateData) {
@@ -397,28 +422,46 @@ export function useRealtimeCanvas({
           return;
         }
 
-        // 2. Fetch any missing strokes and chat
+        // 2. Fetch full state for exact stroke and chat sync
         const stateRes = await fetch('/api/state');
         const stateData = await stateRes.json();
 
         if (stateData.strokes && Array.isArray(stateData.strokes)) {
-          let hasNew = false;
-          stateData.strokes.forEach((s: Stroke) => {
-            if (!knownStrokeIds.current.has(s.id)) {
+          setStrokes(prev => {
+            const serverMap = new Map<string, Stroke>();
+            stateData.strokes.forEach((s: Stroke) => {
+              serverMap.set(s.id, s);
               knownStrokeIds.current.add(s.id);
-              hasNew = true;
-            }
-          });
-
-          if (hasNew) {
-            setStrokes(prev => {
-              const existingMap = new Map(prev.map(p => [p.id, p]));
-              stateData.strokes.forEach((s: Stroke) => {
-                existingMap.set(s.id, s);
-              });
-              return Array.from(existingMap.values());
             });
-          }
+
+            // Preserve local in-flight strokes (< 3s old) not yet echoed back
+            prev.forEach(localStroke => {
+              if (!serverMap.has(localStroke.id)) {
+                if (
+                  localStroke.userId === currentUserRef.current.userId &&
+                  Date.now() - (localStroke.createdAt || 0) < 3000
+                ) {
+                  serverMap.set(localStroke.id, localStroke);
+                }
+              }
+            });
+
+            const reconciled = Array.from(serverMap.values()).sort(
+              (a, b) => (a.createdAt || 0) - (b.createdAt || 0)
+            );
+
+            // Only trigger state update if changed
+            if (reconciled.length !== prev.length) return reconciled;
+            for (let i = 0; i < reconciled.length; i++) {
+              if (
+                reconciled[i].id !== prev[i].id ||
+                Boolean(reconciled[i].isUndone) !== Boolean(prev[i].isUndone)
+              ) {
+                return reconciled;
+              }
+            }
+            return prev;
+          });
         }
 
         if (stateData.chatMessages && Array.isArray(stateData.chatMessages)) {
@@ -439,8 +482,42 @@ export function useRealtimeCanvas({
     syncWithServer();
 
     // Fast sync interval
-    const interval = setInterval(syncWithServer, 1500);
+    const interval = setInterval(syncWithServer, 1200);
     return () => clearInterval(interval);
+  }, []);
+
+  // Update user profile in real-time across all devices
+  const updateUserProfile = useCallback((newName: string, newColor?: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+
+    const updatedUser = {
+      ...currentUserRef.current,
+      username: trimmed,
+      ...(newColor ? { userColor: newColor } : {}),
+    };
+    currentUserRef.current = updatedUser;
+
+    // Optimistically update local online users
+    setOnlineUsers(prev =>
+      prev.map(u => (u.userId === updatedUser.userId ? { ...u, ...updatedUser } : u))
+    );
+
+    // 1. Send via WebSocket if open
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      const msg: WSClientMessage = {
+        type: 'user:update',
+        user: updatedUser,
+      };
+      wsRef.current.send(JSON.stringify(msg));
+    }
+
+    // 2. Send via REST endpoint
+    fetch('/api/user/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user: updatedUser }),
+    }).catch(() => {});
   }, []);
 
   // Broadcast cursor movements (throttled max 30 fps)
@@ -611,18 +688,21 @@ export function useRealtimeCanvas({
       };
 
       // Optimistic instant display
-      setChatMessages(prev => [...prev.slice(-100), localMsg]);
+      setChatMessages(prev => {
+        if (prev.some(m => m.id === localMsg.id)) return prev;
+        return [...prev.slice(-100), localMsg];
+      });
 
-      // 1. Send via WebSocket
+      // 1. Send via WebSocket with identical ID
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         const clientMsg: WSClientMessage = {
           type: 'chat:message',
-          message: { text: trimmed },
+          message: localMsg,
         };
         wsRef.current.send(JSON.stringify(clientMsg));
       }
 
-      // 2. Send via REST endpoint
+      // 2. Send via REST endpoint with identical ID
       fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -632,7 +712,7 @@ export function useRealtimeCanvas({
     []
   );
 
-  // Clear Canvas (Instant 1-click execution for all connected devices!)
+  // Clear Canvas (Instant execution for all connected devices!)
   const clearCanvas = useCallback(
     async (): Promise<{ success: boolean; message: string }> => {
       // 1. Optimistic instant local wipe
@@ -660,26 +740,28 @@ export function useRealtimeCanvas({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username: currentUserRef.current.username }),
         });
-      } catch (err) {
-        // ignore
+        return { success: true, message: 'Canvas cleared' };
+      } catch (e) {
+        return { success: false, message: 'Network error clearing canvas' };
       }
-
-      return { success: true, message: 'Canvas cleared' };
     },
     []
   );
 
-  // Save canvas snapshot
-  const saveSnapshot = useCallback((dataUrl: string, strokeCount: number) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      const msg: WSClientMessage = {
-        type: 'snapshot:create',
-        dataUrl,
-        strokeCount,
-      };
-      wsRef.current.send(JSON.stringify(msg));
-    }
-  }, []);
+  // Save snapshot image to server
+  const saveSnapshot = useCallback(
+    (dataUrl: string, strokeCount: number) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        const msg: WSClientMessage = {
+          type: 'snapshot:create',
+          dataUrl,
+          strokeCount,
+        };
+        wsRef.current.send(JSON.stringify(msg));
+      }
+    },
+    []
+  );
 
   return {
     connectionStatus,
@@ -695,6 +777,7 @@ export function useRealtimeCanvas({
     broadcastLiveStroke,
     commitStroke,
     sendChatMessage,
+    updateUserProfile,
     undo,
     redo,
     clearCanvas,
