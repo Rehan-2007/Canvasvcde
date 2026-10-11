@@ -38,11 +38,26 @@ export function useRealtimeCanvas({
   const [myUndoStack, setMyUndoStack] = useState<string[]>([]);
   const [myRedoStack, setMyRedoStack] = useState<string[]>([]);
 
+  // Stable references to prevent infinite re-render loops
+  const currentUserRef = useRef(currentUser);
+  currentUserRef.current = currentUser;
+  const onRateLimitWarningRef = useRef(onRateLimitWarning);
+  onRateLimitWarningRef.current = onRateLimitWarning;
+  const onCanvasClearedNotificationRef = useRef(onCanvasClearedNotification);
+  onCanvasClearedNotificationRef.current = onCanvasClearedNotification;
+
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const knownStrokeIds = useRef<Set<string>>(new Set());
   const pendingBuffer = useRef<Stroke[]>([]);
   const isMountedRef = useRef(true);
+
+  // References for peer synchronization
+  const strokesRef = useRef<Stroke[]>([]);
+  strokesRef.current = strokes;
+  const chatMessagesRef = useRef<ChatMessage[]>([]);
+  chatMessagesRef.current = chatMessages;
+  const supabaseChannelRef = useRef<any>(null);
 
   // Throttled cursor broadcast
   const lastCursorEmitTime = useRef(0);
@@ -51,13 +66,23 @@ export function useRealtimeCanvas({
   const connectWs = useCallback(() => {
     if (!isMountedRef.current) return;
 
+    // Clean up any stale listeners on previous connection
+    if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      wsRef.current.onmessage = null;
+      wsRef.current.onopen = null;
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
-      setConnectionStatus(prev => ({ ...prev, state: 'connecting' }));
+      setConnectionStatus(prev => prev.state === 'connecting' ? prev : { ...prev, state: 'connecting' });
 
       ws.onopen = () => {
         if (!isMountedRef.current) return;
@@ -66,7 +91,7 @@ export function useRealtimeCanvas({
         // Send Join message
         const joinMsg: WSClientMessage = {
           type: 'join',
-          user: currentUser,
+          user: currentUserRef.current,
         };
         ws.send(JSON.stringify(joinMsg));
 
@@ -98,7 +123,7 @@ export function useRealtimeCanvas({
 
               // Restore user's own undo stack
               const myOwn = validStrokes
-                .filter(s => s.userId === currentUser.userId && !s.isUndone)
+                .filter(s => s.userId === currentUserRef.current.userId && !s.isUndone)
                 .map(s => s.id);
               setMyUndoStack(myOwn);
               break;
@@ -128,7 +153,7 @@ export function useRealtimeCanvas({
             }
 
             case 'cursor:update': {
-              if (msg.cursor.userId === currentUser.userId) return;
+              if (msg.cursor.userId === currentUserRef.current.userId) return;
               setRemoteCursors(prev => {
                 const next = new Map(prev);
                 next.set(msg.cursor.userId, msg.cursor);
@@ -138,7 +163,7 @@ export function useRealtimeCanvas({
             }
 
             case 'stroke:live': {
-              if (msg.stroke.userId === currentUser.userId) return;
+              if (msg.stroke.userId === currentUserRef.current.userId) return;
               setLiveRemoteStrokes(prev => {
                 const next = new Map(prev);
                 if (msg.stroke.userId) {
@@ -195,8 +220,8 @@ export function useRealtimeCanvas({
               setLiveRemoteStrokes(new Map());
               setMyUndoStack([]);
               setMyRedoStack([]);
-              if (onCanvasClearedNotification) {
-                onCanvasClearedNotification(msg.moderatorUsername);
+              if (onCanvasClearedNotificationRef.current) {
+                onCanvasClearedNotificationRef.current(msg.moderatorUsername);
               }
               break;
             }
@@ -216,8 +241,8 @@ export function useRealtimeCanvas({
             }
 
             case 'rate_limit': {
-              if (onRateLimitWarning) {
-                onRateLimitWarning(msg.message);
+              if (onRateLimitWarningRef.current) {
+                onRateLimitWarningRef.current(msg.message);
               }
               break;
             }
@@ -229,20 +254,20 @@ export function useRealtimeCanvas({
 
       ws.onclose = () => {
         if (!isMountedRef.current) return;
-        setConnectionStatus(prev => ({ ...prev, state: 'reconnecting' }));
-        // Try reconnecting after 2 seconds
-        reconnectTimeoutRef.current = setTimeout(connectWs, 2000);
+        setConnectionStatus(prev => prev.state === 'reconnecting' ? prev : { ...prev, state: 'reconnecting' });
+        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = setTimeout(connectWs, 3000);
       };
 
       ws.onerror = (err) => {
-        console.warn('[CollabCanvas] WebSocket error, will reconnect...', err);
-        ws.close();
+        console.warn('[CollabCanvas] WebSocket connection note:', err);
       };
     } catch (e) {
       console.error('[CollabCanvas] WebSocket connection failed:', e);
-      reconnectTimeoutRef.current = setTimeout(connectWs, 3000);
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = setTimeout(connectWs, 4000);
     }
-  }, [currentUser, onCanvasClearedNotification, onRateLimitWarning]);
+  }, []); // Empty dependencies ensure stable connection function!
 
   // Connect on mount
   useEffect(() => {
@@ -269,52 +294,194 @@ export function useRealtimeCanvas({
       isMountedRef.current = false;
       clearInterval(cursorInterval);
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      if (wsRef.current) wsRef.current.close();
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onopen = null;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
   }, [connectWs]);
 
-  // Optional Supabase Realtime Sync Integration
+  // Global Supabase Realtime Broadcast & Presence Integration (Bridges all devices worldwide)
   useEffect(() => {
     const supabase = getSupabaseClient();
-    const config = getStoredSupabaseConfig();
-    if (!supabase || !config) return;
+    if (!supabase) return;
 
     let channel: any = null;
     try {
-      channel = supabase
-        .channel('collab-drawings')
-        .on(
-          'postgres_changes',
-          { event: 'INSERT', schema: 'public', table: 'drawings' },
-          (payload: any) => {
-            const row = payload.new;
-            if (row && !knownStrokeIds.current.has(row.id)) {
-              const parsedStroke: Stroke = {
-                id: row.id,
-                userId: row.user_id,
-                username: row.username,
-                tool: row.tool,
-                color: row.color,
-                size: Number(row.size),
-                opacity: Number(row.opacity),
-                points: row.points || [],
-                shapeData: row.shape_data,
-                createdAt: new Date(row.created_at).getTime(),
-                isUndone: Boolean(row.is_undone),
-              };
-              knownStrokeIds.current.add(parsedStroke.id);
-              setStrokes(prev => [...prev, parsedStroke]);
-            }
+      channel = supabase.channel('collabcanvas-global-room', {
+        config: {
+          broadcast: { ack: false, self: false },
+          presence: { key: currentUser.userId },
+        },
+      });
+      supabaseChannelRef.current = channel;
+
+      // 1. Receive committed strokes from other devices
+      channel.on('broadcast', { event: 'stroke:commit' }, (payload: any) => {
+        const stroke = payload.payload?.stroke as Stroke;
+        if (!stroke || knownStrokeIds.current.has(stroke.id)) return;
+        knownStrokeIds.current.add(stroke.id);
+        setStrokes(prev => [...prev, stroke]);
+
+        if (stroke.userId) {
+          setLiveRemoteStrokes(prev => {
+            const next = new Map(prev);
+            next.delete(stroke.userId);
+            return next;
+          });
+        }
+      });
+
+      // 2. Receive live in-progress strokes
+      channel.on('broadcast', { event: 'stroke:live' }, (payload: any) => {
+        const stroke = payload.payload?.stroke as Partial<Stroke> & { id: string };
+        if (!stroke || stroke.userId === currentUser.userId) return;
+        setLiveRemoteStrokes(prev => {
+          const next = new Map(prev);
+          if (stroke.userId) next.set(stroke.userId, stroke);
+          return next;
+        });
+      });
+
+      // 3. Receive remote cursors
+      channel.on('broadcast', { event: 'cursor:move' }, (payload: any) => {
+        const cursor = payload.payload?.cursor as RemoteCursor;
+        if (!cursor || cursor.userId === currentUser.userId) return;
+        setRemoteCursors(prev => {
+          const next = new Map(prev);
+          next.set(cursor.userId, cursor);
+          return next;
+        });
+      });
+
+      // 4. Undo and Redo from remote devices
+      channel.on('broadcast', { event: 'stroke:undo' }, (payload: any) => {
+        const { strokeId } = payload.payload || {};
+        if (strokeId) {
+          setStrokes(prev => prev.map(s => (s.id === strokeId ? { ...s, isUndone: true } : s)));
+        }
+      });
+
+      channel.on('broadcast', { event: 'stroke:redo' }, (payload: any) => {
+        const { strokeId } = payload.payload || {};
+        if (strokeId) {
+          setStrokes(prev => prev.map(s => (s.id === strokeId ? { ...s, isUndone: false } : s)));
+        }
+      });
+
+      // 5. Canvas Clear
+      channel.on('broadcast', { event: 'canvas:clear' }, (payload: any) => {
+        knownStrokeIds.current.clear();
+        setStrokes([]);
+        setSnapshot(null);
+        setLiveRemoteStrokes(new Map());
+        setMyUndoStack([]);
+        setMyRedoStack([]);
+        if (onCanvasClearedNotification) {
+          onCanvasClearedNotification(payload.payload?.username || 'Artist');
+        }
+      });
+
+      // 6. Live Chat Messages
+      channel.on('broadcast', { event: 'chat:message' }, (payload: any) => {
+        const msg = payload.payload?.message as ChatMessage;
+        if (!msg) return;
+        setChatMessages(prev => {
+          if (prev.some(m => m.id === msg.id)) return prev;
+          return [...prev.slice(-100), msg];
+        });
+      });
+
+      // 7. Initial Canvas Synchronization between devices!
+      // When a new device joins, it asks existing devices for current artwork
+      channel.on('broadcast', { event: 'canvas:request_sync' }, (payload: any) => {
+        const targetUserId = payload.payload?.userId;
+        if (!targetUserId || targetUserId === currentUser.userId) return;
+        const currentValidStrokes = strokesRef.current.filter(s => !s.isUndone);
+        if (currentValidStrokes.length > 0) {
+          channel.send({
+            type: 'broadcast',
+            event: 'canvas:sync_response',
+            payload: {
+              targetUserId,
+              strokes: currentValidStrokes,
+              chatMessages: chatMessagesRef.current.slice(-30),
+            },
+          });
+        }
+      });
+
+      channel.on('broadcast', { event: 'canvas:sync_response' }, (payload: any) => {
+        const { targetUserId, strokes: receivedStrokes, chatMessages: receivedChat } = payload.payload || {};
+        if (targetUserId === currentUser.userId && Array.isArray(receivedStrokes)) {
+          receivedStrokes.forEach((s: Stroke) => {
+            knownStrokeIds.current.add(s.id);
+          });
+          setStrokes(prev => {
+            const existingIds = new Set(prev.map(p => p.id));
+            const newStrokes = receivedStrokes.filter((s: Stroke) => !existingIds.has(s.id));
+            return [...prev, ...newStrokes];
+          });
+          if (Array.isArray(receivedChat)) {
+            setChatMessages(prev => {
+              const existingIds = new Set(prev.map(p => p.id));
+              const newChat = receivedChat.filter((c: ChatMessage) => !existingIds.has(c.id));
+              return [...prev, ...newChat];
+            });
           }
-        )
-        .subscribe();
+        }
+      });
+
+      // 8. Presence tracking across all devices
+      channel.on('presence', { event: 'sync' }, () => {
+        const presenceState = channel.presenceState();
+        const online: OnlineUser[] = [];
+        Object.values(presenceState).forEach((presences: any) => {
+          presences.forEach((p: any) => {
+            if (p.userId && !online.some(u => u.userId === p.userId)) {
+              online.push({
+                userId: p.userId,
+                username: p.username || 'Artist',
+                userColor: p.userColor || '#38bdf8',
+                joinedAt: p.joinedAt || Date.now(),
+              });
+            }
+          });
+        });
+        if (online.length > 0) {
+          setOnlineUsers(online);
+        }
+      });
+
+      channel.subscribe((status: string) => {
+        if (status === 'SUBSCRIBED') {
+          setConnectionStatus({ state: 'connected', transport: 'supabase' });
+          channel.track({
+            userId: currentUserRef.current.userId,
+            username: currentUserRef.current.username,
+            userColor: currentUserRef.current.userColor,
+            joinedAt: Date.now(),
+          });
+          // Request existing drawings from any device already online
+          channel.send({
+            type: 'broadcast',
+            event: 'canvas:request_sync',
+            payload: { userId: currentUserRef.current.userId },
+          });
+        }
+      });
     } catch (err) {
-      console.warn('[CollabCanvas] Supabase Realtime subscribe note:', err);
+      console.warn('[CollabCanvas] Supabase channel error:', err);
     }
 
     return () => {
       if (channel) {
         supabase.removeChannel(channel);
+        supabaseChannelRef.current = null;
       }
     };
   }, []);
@@ -326,6 +493,27 @@ export function useRealtimeCanvas({
       if (now - lastCursorEmitTime.current < 33) return;
       lastCursorEmitTime.current = now;
 
+      // 1. Broadcast to all devices via Supabase
+      if (supabaseChannelRef.current) {
+        supabaseChannelRef.current.send({
+          type: 'broadcast',
+          event: 'cursor:move',
+          payload: {
+            cursor: {
+              userId: currentUser.userId,
+              username: currentUser.username,
+              userColor: currentUser.userColor,
+              x,
+              y,
+              tool,
+              isDrawing,
+              lastActive: now,
+            },
+          },
+        });
+      }
+
+      // 2. Broadcast via local WebSocket
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         const msg: WSClientMessage = {
           type: 'cursor:move',
@@ -334,23 +522,38 @@ export function useRealtimeCanvas({
         wsRef.current.send(JSON.stringify(msg));
       }
     },
-    []
+    [currentUser]
   );
 
   // Broadcast live in-progress stroke points
-  const broadcastLiveStroke = useCallback((liveStroke: Partial<Stroke> & { id: string }) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      const msg: WSClientMessage = {
-        type: 'stroke:live',
-        stroke: {
-          ...liveStroke,
-          userId: currentUser.userId,
-          username: currentUser.username,
-        },
+  const broadcastLiveStroke = useCallback(
+    (liveStroke: Partial<Stroke> & { id: string }) => {
+      const payloadStroke = {
+        ...liveStroke,
+        userId: currentUser.userId,
+        username: currentUser.username,
       };
-      wsRef.current.send(JSON.stringify(msg));
-    }
-  }, [currentUser]);
+
+      // 1. Broadcast to all devices via Supabase
+      if (supabaseChannelRef.current) {
+        supabaseChannelRef.current.send({
+          type: 'broadcast',
+          event: 'stroke:live',
+          payload: { stroke: payloadStroke },
+        });
+      }
+
+      // 2. Broadcast via local WebSocket
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        const msg: WSClientMessage = {
+          type: 'stroke:live',
+          stroke: payloadStroke,
+        };
+        wsRef.current.send(JSON.stringify(msg));
+      }
+    },
+    [currentUser]
+  );
 
   // Commit a completed stroke
   const commitStroke = useCallback(
@@ -361,34 +564,21 @@ export function useRealtimeCanvas({
       setMyUndoStack(prev => [...prev, stroke.id]);
       setMyRedoStack([]); // Clear redo stack on new action
 
-      // Send via WebSocket
+      // 1. Broadcast to ALL devices worldwide via Supabase Realtime!
+      if (supabaseChannelRef.current) {
+        supabaseChannelRef.current.send({
+          type: 'broadcast',
+          event: 'stroke:commit',
+          payload: { stroke },
+        });
+      }
+
+      // 2. Send via local WebSocket for server persistence
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         const msg: WSClientMessage = { type: 'stroke:commit', stroke };
         wsRef.current.send(JSON.stringify(msg));
       } else {
         pendingBuffer.current.push(stroke);
-      }
-
-      // If Supabase is available, asynchronously save there as well
-      const supabase = getSupabaseClient();
-      if (supabase) {
-        supabase
-          .from('drawings')
-          .insert({
-            id: stroke.id,
-            user_id: stroke.userId,
-            username: stroke.username,
-            tool: stroke.tool,
-            color: stroke.color,
-            size: stroke.size,
-            opacity: stroke.opacity,
-            points: stroke.points,
-            shape_data: stroke.shapeData || null,
-            is_undone: false,
-          })
-          .then(({ error }: any) => {
-            if (error) console.warn('[CollabCanvas] Supabase stroke insert note:', error.message);
-          });
       }
     },
     []
@@ -407,7 +597,16 @@ export function useRealtimeCanvas({
       prev.map(s => (s.id === strokeIdToUndo ? { ...s, isUndone: true } : s))
     );
 
-    // Send to server
+    // 1. Broadcast to all devices via Supabase
+    if (supabaseChannelRef.current) {
+      supabaseChannelRef.current.send({
+        type: 'broadcast',
+        event: 'stroke:undo',
+        payload: { strokeId: strokeIdToUndo, userId: currentUser.userId },
+      });
+    }
+
+    // 2. Send to local WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       const msg: WSClientMessage = {
         type: 'stroke:undo',
@@ -415,12 +614,6 @@ export function useRealtimeCanvas({
         userId: currentUser.userId,
       };
       wsRef.current.send(JSON.stringify(msg));
-    }
-
-    // Supabase update if configured
-    const supabase = getSupabaseClient();
-    if (supabase) {
-      supabase.from('drawings').update({ is_undone: true }).eq('id', strokeIdToUndo);
     }
   }, [myUndoStack, currentUser.userId]);
 
@@ -437,6 +630,16 @@ export function useRealtimeCanvas({
       prev.map(s => (s.id === strokeIdToRedo ? { ...s, isUndone: false } : s))
     );
 
+    // 1. Broadcast to all devices via Supabase
+    if (supabaseChannelRef.current) {
+      supabaseChannelRef.current.send({
+        type: 'broadcast',
+        event: 'stroke:redo',
+        payload: { strokeId: strokeIdToRedo, userId: currentUser.userId },
+      });
+    }
+
+    // 2. Send to local WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       const msg: WSClientMessage = {
         type: 'stroke:redo',
@@ -444,11 +647,6 @@ export function useRealtimeCanvas({
         userId: currentUser.userId,
       };
       wsRef.current.send(JSON.stringify(msg));
-    }
-
-    const supabase = getSupabaseClient();
-    if (supabase) {
-      supabase.from('drawings').update({ is_undone: false }).eq('id', strokeIdToRedo);
     }
   }, [myRedoStack, currentUser.userId]);
 
@@ -471,6 +669,16 @@ export function useRealtimeCanvas({
 
       setChatMessages(prev => [...prev.slice(-100), localMsg]);
 
+      // 1. Broadcast to all devices via Supabase
+      if (supabaseChannelRef.current) {
+        supabaseChannelRef.current.send({
+          type: 'broadcast',
+          event: 'chat:message',
+          payload: { message: localMsg },
+        });
+      }
+
+      // 2. Send to local WebSocket
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         const clientMsg: WSClientMessage = {
           type: 'chat:message',
@@ -493,7 +701,16 @@ export function useRealtimeCanvas({
       setMyUndoStack([]);
       setMyRedoStack([]);
 
-      // 2. Broadcast immediately over WebSocket
+      // 2. Broadcast to all devices via Supabase
+      if (supabaseChannelRef.current) {
+        supabaseChannelRef.current.send({
+          type: 'broadcast',
+          event: 'canvas:clear',
+          payload: { username: currentUser.username },
+        });
+      }
+
+      // 3. Broadcast immediately over WebSocket
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         const msg: WSClientMessage = {
           type: 'canvas:clear',
@@ -503,7 +720,7 @@ export function useRealtimeCanvas({
         wsRef.current.send(JSON.stringify(msg));
       }
 
-      // 3. Notify server endpoint
+      // 4. Notify server endpoint
       try {
         fetch('/api/moderator/clear', {
           method: 'POST',

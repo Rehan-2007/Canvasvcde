@@ -72,6 +72,14 @@ export default function App() {
     setCurrentUser(prev => ({ ...prev, username: newName }));
   };
 
+  const handleRateLimitWarning = useCallback((msg: string) => {
+    showBanner(msg);
+  }, [showBanner]);
+
+  const handleCanvasCleared = useCallback((modName: string) => {
+    showBanner(`Shared canvas cleared by ${modName}`);
+  }, [showBanner]);
+
   // Real-time canvas engine & live communication hook (Single authoritative WebSocket)
   const {
     connectionStatus,
@@ -93,9 +101,8 @@ export default function App() {
     saveSnapshot,
   } = useRealtimeCanvas({
     currentUser,
-    onRateLimitWarning: (msg) => showBanner(msg),
-    onCanvasClearedNotification: (modName) =>
-      showBanner(`Shared canvas cleared by ${modName}`),
+    onRateLimitWarning: handleRateLimitWarning,
+    onCanvasClearedNotification: handleCanvasCleared,
   });
 
   // Live chat moderation & filtering
