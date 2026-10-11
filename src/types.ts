@@ -89,7 +89,7 @@ export interface UserReport {
 
 export interface ConnectionStatus {
   state: 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
-  transport: 'websocket' | 'supabase';
+  transport: 'websocket' | 'sse' | 'realtime' | 'syncing';
   latencyMs?: number;
 }
 

@@ -72,6 +72,12 @@ export function Canvas({
   const shapeStartRef = useRef<Point | null>(null);
   const lastLiveBroadcastRef = useRef<number>(0);
 
+  // Eraser hover cursor position in screen coordinates
+  const [eraserCursorPos, setEraserCursorPos] = useState<{ x: number; y: number } | null>(null);
+
+  // Eraser size: calibrated for comfortable doodle and ink erasing
+  const effectiveEraserSize = Math.max(28, brushSize * 2.5);
+
   // Space key tracker for canvas panning
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -101,7 +107,7 @@ export function Canvas({
   const lastSnapshotStrokeCount = useRef(0);
   useEffect(() => {
     const validCount = strokes.filter(s => !s.isUndone).length;
-    if (validCount > 0 && validCount - lastSnapshotStrokeCount.current >= 40) {
+    if (validCount > 0 && validCount - lastSnapshotStrokeCount.current >= 50) {
       lastSnapshotStrokeCount.current = validCount;
       if (baseCanvasRef.current) {
         const dataUrl = baseCanvasRef.current.toDataURL('image/png', 0.85);
@@ -117,7 +123,7 @@ export function Canvas({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Reset base canvas - completely transparent so destination-out genuinely erases ink!
+    // Completely clear base canvas
     ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
     // Render snapshot image if available
@@ -155,11 +161,20 @@ export function Canvas({
     liveRemoteStrokes.forEach((remoteStroke, remoteUserId) => {
       if (blockedUsers.has(remoteUserId)) return;
       if (remoteStroke.id && remoteStroke.points && remoteStroke.points.length > 0) {
-        renderStroke(ctx, remoteStroke as Stroke);
+        if (remoteStroke.tool === 'eraser') {
+          // Live remote eraser directly cuts ink on base canvas
+          const baseCanvas = baseCanvasRef.current;
+          if (baseCanvas) {
+            const baseCtx = baseCanvas.getContext('2d');
+            if (baseCtx) renderStroke(baseCtx, remoteStroke as Stroke);
+          }
+        } else {
+          renderStroke(ctx, remoteStroke as Stroke);
+        }
       }
     });
 
-    // Draw local active stroke
+    // Draw local active stroke on preview canvas
     if (isDrawingRef.current) {
       if (currentTool === 'eraser') {
         // Eraser preview indicator
@@ -167,9 +182,10 @@ export function Canvas({
           const lastPt = currentPointsRef.current[currentPointsRef.current.length - 1];
           ctx.save();
           ctx.beginPath();
-          ctx.arc(lastPt.x, lastPt.y, brushSize / 2, 0, Math.PI * 2);
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
-          ctx.lineWidth = 1.5;
+          ctx.arc(lastPt.x, lastPt.y, effectiveEraserSize / 2, 0, Math.PI * 2);
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([4, 4]);
           ctx.stroke();
           ctx.restore();
         }
@@ -220,6 +236,7 @@ export function Canvas({
     currentTool,
     currentColor,
     brushSize,
+    effectiveEraserSize,
     opacity,
     isFilledShape,
     currentUser,
@@ -229,25 +246,28 @@ export function Canvas({
     redrawPreview();
   }, [redrawPreview, liveRemoteStrokes]);
 
-  // Handle Zoom with mouse wheel or pinch
+  // Handle Zoom with mouse wheel or trackpad
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     if (e.ctrlKey || e.metaKey) {
-      // Zoom
       const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
       const newZoom = Math.min(Math.max(zoom * zoomFactor, 0.25), 3.5);
-      
+
       const rect = containerRef.current?.getBoundingClientRect();
       if (rect) {
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
-        const newPanX = mouseX - (mouseX - pan.x) * (newZoom / zoom);
-        const newPanY = mouseY - (mouseY - pan.y) * (newZoom / zoom);
-        onPanChange({ x: newPanX, y: newPanY });
+        const canvasX = (mouseX - pan.x) / zoom;
+        const canvasY = (mouseY - pan.y) / zoom;
+
+        onPanChange({
+          x: mouseX - canvasX * newZoom,
+          y: mouseY - canvasY * newZoom,
+        });
       }
       onZoomChange(newZoom);
     } else {
-      // Pan
+      // Pan canvas
       onPanChange(prev => ({
         x: prev.x - e.deltaX,
         y: prev.y - e.deltaY,
@@ -258,7 +278,6 @@ export function Canvas({
   // Pointer Down
   const handlePointerDown = (e: React.PointerEvent) => {
     if (e.button === 1 || isSpacePressedRef.current || currentTool === 'pan') {
-      // Panning
       isPanningRef.current = true;
       panStartRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y };
       return;
@@ -278,7 +297,6 @@ export function Canvas({
         const ctx = baseCanvas.getContext('2d');
         if (ctx) {
           floodFill(ctx, canvasPt.x, canvasPt.y, currentColor, opacity);
-          // Commit as fill stroke snapshot or data
           const stroke: Stroke = {
             id: 'fill_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
             userId: currentUser.userId,
@@ -316,6 +334,22 @@ export function Canvas({
     shapeStartRef.current = canvasPt;
     currentPointsRef.current = [canvasPt];
 
+    // IF ERASING: Execute instant erase on base canvas at clicked point!
+    if (currentTool === 'eraser') {
+      const baseCanvas = baseCanvasRef.current;
+      if (baseCanvas) {
+        const baseCtx = baseCanvas.getContext('2d');
+        if (baseCtx) {
+          baseCtx.save();
+          baseCtx.globalCompositeOperation = 'destination-out';
+          baseCtx.beginPath();
+          baseCtx.arc(canvasPt.x, canvasPt.y, effectiveEraserSize / 2, 0, Math.PI * 2);
+          baseCtx.fill();
+          baseCtx.restore();
+        }
+      }
+    }
+
     onBroadcastCursor(canvasPt.x, canvasPt.y, currentTool, true);
     redrawPreview();
   };
@@ -324,6 +358,12 @@ export function Canvas({
   const handlePointerMove = (e: React.PointerEvent) => {
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
+
+    if (currentTool === 'eraser') {
+      setEraserCursorPos({ x: e.clientX, y: e.clientY });
+    } else if (eraserCursorPos) {
+      setEraserCursorPos(null);
+    }
 
     if (isPanningRef.current) {
       onPanChange({
@@ -355,7 +395,7 @@ export function Canvas({
           baseCtx.globalCompositeOperation = 'destination-out';
           baseCtx.lineCap = 'round';
           baseCtx.lineJoin = 'round';
-          baseCtx.lineWidth = brushSize;
+          baseCtx.lineWidth = effectiveEraserSize;
           baseCtx.beginPath();
           baseCtx.moveTo(p1.x, p1.y);
           baseCtx.lineTo(p2.x, p2.y);
@@ -377,9 +417,9 @@ export function Canvas({
           id: currentStrokeIdRef.current,
           tool: currentTool,
           color: currentColor,
-          size: brushSize,
+          size: currentTool === 'eraser' ? effectiveEraserSize : brushSize,
           opacity,
-          points: currentPointsRef.current.slice(-15),
+          points: currentPointsRef.current,
         });
       } else if (['rectangle', 'circle', 'triangle', 'line', 'arrow'].includes(currentTool)) {
         if (shapeStartRef.current) {
@@ -433,39 +473,30 @@ export function Canvas({
       userId: currentUser.userId,
       username: currentUser.username,
       tool: currentTool,
-      color: currentColor,
-      size: brushSize,
+      color: currentTool === 'eraser' ? '#000000' : currentColor,
+      size: currentTool === 'eraser' ? effectiveEraserSize : brushSize,
       opacity,
       points,
       shapeData: finalShapeData,
       createdAt: Date.now(),
     };
 
-    // Commit locally and sync
     onCommitStroke(stroke);
 
-    // Reset temporary states
     currentPointsRef.current = [];
     shapeStartRef.current = null;
     redrawPreview();
-
-    // Broadcast cursor state updated to not drawing
-    if (points.length > 0) {
-      const lastPt = points[points.length - 1];
-      onBroadcastCursor(lastPt.x, lastPt.y, currentTool, false);
-    }
   };
 
-  // Handle Commit Text
+  // Commit Inline Text
   const handleCommitText = () => {
     if (!textInputPos || !textInputValue.trim()) {
       setTextInputPos(null);
-      setTextInputValue('');
       return;
     }
 
     const stroke: Stroke = {
-      id: 'text_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      id: 'txt_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
       userId: currentUser.userId,
       username: currentUser.username,
       tool: 'text',
@@ -491,16 +522,37 @@ export function Canvas({
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full overflow-hidden select-none bg-zinc-950 cursor-crosshair touch-none"
+      className="relative w-full h-full overflow-hidden select-none bg-zinc-950 touch-none"
       onWheel={handleWheel}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
+      onPointerLeave={() => setEraserCursorPos(null)}
       style={{
-        cursor: currentTool === 'pan' ? (isPanningRef.current ? 'grabbing' : 'grab') : 'crosshair',
+        cursor:
+          currentTool === 'pan'
+            ? isPanningRef.current
+              ? 'grabbing'
+              : 'grab'
+            : currentTool === 'eraser'
+            ? 'none'
+            : 'crosshair',
       }}
     >
+      {/* Floating Eraser Ring Cursor */}
+      {currentTool === 'eraser' && eraserCursorPos && (
+        <div
+          className="fixed pointer-events-none rounded-full border-2 border-white/80 bg-white/10 shadow-lg z-50 -translate-x-1/2 -translate-y-1/2 transition-transform duration-75"
+          style={{
+            left: eraserCursorPos.x,
+            top: eraserCursorPos.y,
+            width: effectiveEraserSize * zoom,
+            height: effectiveEraserSize * zoom,
+          }}
+        />
+      )}
+
       {/* Transformed Canvas Container */}
       <div
         className="absolute origin-top-left will-change-transform"
@@ -604,7 +656,7 @@ export function Canvas({
               if (e.key === 'Escape') setTextInputPos(null);
             }}
             placeholder="Type text and press Enter..."
-            className="bg-zinc-950 text-zinc-100 text-sm px-2.5 py-1.5 rounded border border-zinc-750 focus:outline-none focus:border-zinc-500 w-52"
+            className="bg-zinc-950 text-zinc-100 text-sm px-2.5 py-1.5 rounded border border-zinc-700 focus:outline-none focus:border-zinc-500 w-52"
           />
           <button
             onClick={handleCommitText}
