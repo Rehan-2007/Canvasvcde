@@ -1,0 +1,6 @@
+{
+  "name": "CollabCanvas",
+  "description": "Real-time collaborative drawing canvas with live sync, chat, cursors, rich tools, and moderation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
